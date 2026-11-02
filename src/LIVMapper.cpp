@@ -301,17 +301,17 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node
 {
   image_transport::ImageTransport it(this->node);
   if (p_pre->lidar_type == AVIA) {
-    sub_pcl = this->node->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 200000, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
+    sub_pcl = this->node->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, MAX_LIDAR_BUFFER, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
   } else {
-    sub_pcl = this->node->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, 200000, std::bind(&LIVMapper::standard_pcl_cbk, this, std::placeholders::_1));
+    sub_pcl = this->node->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, MAX_LIDAR_BUFFER, std::bind(&LIVMapper::standard_pcl_cbk, this, std::placeholders::_1));
   }
-  sub_imu = this->node->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 200000, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1));
+  sub_imu = this->node->create_subscription<sensor_msgs::msg::Imu>(imu_topic, MAX_IMU_BUFFER, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1));
   if (enable_image_processing) {
     sub_img_compressed = this->node->create_subscription<sensor_msgs::msg::CompressedImage>(
-      img_topic, 200000, std::bind(&LIVMapper::jpeg_callback, this, std::placeholders::_1));
+      img_topic, MAX_IMG_BUFFER, std::bind(&LIVMapper::jpeg_callback, this, std::placeholders::_1));
   } else {
     sub_img = this->node->create_subscription<sensor_msgs::msg::Image>(
-      img_topic, 200000, std::bind(&LIVMapper::img_cbk, this, std::placeholders::_1));
+      img_topic, MAX_IMG_BUFFER, std::bind(&LIVMapper::img_cbk, this, std::placeholders::_1));
   }
   pubLaserCloudFullRes = this->node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 100);
   pubNormal = this->node->create_publisher<visualization_msgs::msg::MarkerArray>("/visualization_marker", 100);
@@ -364,6 +364,12 @@ void LIVMapper::jpeg_callback(const sensor_msgs::msg::CompressedImage::SharedPtr
         mtx_buffer.lock();
         img_buffer.push_back(image);
         img_time_buffer.push_back(msg_header_time);
+        if (img_buffer.size() > MAX_IMG_BUFFER)
+        {
+          img_buffer.pop_front();
+          img_time_buffer.pop_front();
+          warnDropped("image");
+        }
         last_timestamp_img = msg_header_time;
         mtx_buffer.unlock();
         // Notify processing thread
@@ -846,6 +852,12 @@ void LIVMapper::RGBpointBodyToWorld(PointType const *const pi, PointType *const 
   po->intensity = pi->intensity;
 }
 
+void LIVMapper::warnDropped(const char *what)
+{
+  RCLCPP_WARN_THROTTLE(this->node->get_logger(), *this->node->get_clock(), 5000,
+                       "Dropping old %s data: the mapper is behind, or the LiDAR, IMU and image clocks disagree", what);
+}
+
 void LIVMapper::standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg)
 {
   if (!lidar_en) return;
@@ -864,6 +876,12 @@ void LIVMapper::standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::ConstShare
   lid_raw_data_buffer.push_back(ptr);
   lid_header_time_buffer.push_back(cur_head_time);
   last_timestamp_lidar = cur_head_time;
+  if (lid_raw_data_buffer.size() > MAX_LIDAR_BUFFER)
+  {
+    lid_raw_data_buffer.pop_front();
+    lid_header_time_buffer.pop_front();
+    warnDropped("LiDAR");
+  }
 
   mtx_buffer.unlock();
   sig_buffer.notify_all();
@@ -907,6 +925,12 @@ void LIVMapper::livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::ConstShar
   lid_raw_data_buffer.push_back(ptr);
   lid_header_time_buffer.push_back(cur_head_time);
   last_timestamp_lidar = cur_head_time;
+  if (lid_raw_data_buffer.size() > MAX_LIDAR_BUFFER)
+  {
+    lid_raw_data_buffer.pop_front();
+    lid_header_time_buffer.pop_front();
+    warnDropped("LiDAR");
+  }
 
   mtx_buffer.unlock();
   sig_buffer.notify_all();
@@ -917,7 +941,6 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
   if (!imu_en) return;
 
   if (last_timestamp_lidar < 0.0) return;
-  RCLCPP_INFO(this->node->get_logger(), "get imu at time: %.6f", stamp2Sec(msg_in->header.stamp));
   sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
   msg->header.stamp = sec2Stamp(stamp2Sec(msg->header.stamp) - imu_time_offset);
   double timestamp = stamp2Sec(msg->header.stamp);
@@ -942,16 +965,15 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
 
   if (last_timestamp_imu > 0.0 && timestamp > last_timestamp_imu + 0.2)
   {
+    // Keep the message: dropping it left last_timestamp_imu behind, so every later message was
+    // dropped too, sync_packages never ran again and the scan and image buffers grew until OOM.
     RCLCPP_WARN(this->node->get_logger(), "imu time stamp Jumps %0.4lf seconds \n", timestamp - last_timestamp_imu);
-    mtx_buffer.unlock();
-    sig_buffer.notify_all();
-    return;
   }
 
   last_timestamp_imu = timestamp;
 
   imu_buffer.push_back(msg);
-  cout<<"got imu: "<<timestamp<<" imu size "<<imu_buffer.size()<<endl;
+  if (imu_buffer.size() > MAX_IMU_BUFFER) { imu_buffer.pop_front(); warnDropped("IMU"); }
   mtx_buffer.unlock();
   if (imu_prop_enable)
   {
@@ -1020,6 +1042,12 @@ void LIVMapper::img_cbk(const sensor_msgs::msg::Image::ConstSharedPtr &msg_in)
   cv::Mat img_cur = getImageFromMsg(msg);
   img_buffer.push_back(img_cur);
   img_time_buffer.push_back(img_time_correct);
+  if (img_buffer.size() > MAX_IMG_BUFFER)
+  {
+    img_buffer.pop_front();
+    img_time_buffer.pop_front();
+    warnDropped("image");
+  }
 
   // ROS_INFO("Correct Image time: %.6f", img_time_correct);
 

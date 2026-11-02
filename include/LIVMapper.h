@@ -47,6 +47,9 @@ public:
   void pointBodyToWorld(const PointType &pi, PointType &po);
  
   void RGBpointBodyToWorld(PointType const *const pi, PointType *const po);
+  // About 1 s of scans and images, 10 s of IMU at 200 Hz.
+  static constexpr size_t MAX_LIDAR_BUFFER = 10, MAX_IMG_BUFFER = 10, MAX_IMU_BUFFER = 2000;
+  void warnDropped(const char *what);
   void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
   void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::ConstSharedPtr &msg_in);
   void imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in);
